@@ -1,15 +1,15 @@
 # syntax=docker/dockerfile:1
 
 ########## Builder ##########
+# rust:bookworm основан на buildpack-deps:bookworm — в базе уже есть
+# gcc/g++/make, libc6-dev, libssl-dev и ca-certificates, ставить их не нужно.
+# Доустанавливаем только pkg-config (в базе отсутствует): он потребуется
+# openssl-sys, когда в проект добавятся TLS-зависимости.
 FROM rust:bookworm AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential \
         pkg-config \
-        libssl-dev \
-        ca-certificates \
-    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTFLAGS="-C target-cpu=broadwell"

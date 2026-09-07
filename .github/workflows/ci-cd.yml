@@ -64,6 +64,7 @@ jobs:
       uses: docker/setup-buildx-action@v4
 
     - name: Build Docker image
+      id: build
       uses: docker/build-push-action@v7
       with:
         context: .
@@ -76,9 +77,9 @@ jobs:
 
     - name: Smoke test image
       run: |
-        timeout 20 docker run --rm "$IMAGE" || test $? -eq 124
+        timeout 20 docker run --rm "$IMAGE_ID" || test $? -eq 124
       env:
-        IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}
+        IMAGE_ID: ${{ steps.build.outputs.imageid }}
 
   # Сборка и публикация в GHCR — только на push (main и теги v*) или вручную
   build-and-push:
@@ -129,10 +130,9 @@ jobs:
 
     - name: Smoke test image
       run: |
-        img="${TAGS%%,*}"
-        timeout 20 docker run --rm "$img" || test $? -eq 124
+        timeout 20 docker run --rm "$IMAGE_ID" || test $? -eq 124
       env:
-        TAGS: ${{ steps.meta.outputs.tags }}
+        IMAGE_ID: ${{ steps.build.outputs.imageid }}
 
     - name: Print image info
       run: |

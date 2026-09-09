@@ -5,6 +5,8 @@
 pub struct Config {
     /// Базовый URL REST API биржи KuCoin.
     pub api_base: String,
+    /// Биржа-источник для ключа свечей в БД (kucoin, binance, ...).
+    pub exchange: String,
     /// Таймфреймы свечей (KuCoin): 1min, 3min, 5min, 15min, 30min, 1hour,
     /// 2hour, 4hour, 6hour, 8hour, 12hour, 1day, 1week.
     /// Подписка создаётся на каждую пару × каждый интервал.
@@ -34,6 +36,9 @@ pub struct Config {
     pub backfill_bars: usize,
     /// Максимум одновременных REST-запросов бэкфилла.
     pub backfill_concurrency: usize,
+    /// URL PostgreSQL для записи свечей (KCS_DATABASE_URL или DATABASE_URL).
+    /// None = запись выключена (только stdout/статистика).
+    pub db_url: Option<String>,
 }
 
 impl Config {
@@ -42,6 +47,7 @@ impl Config {
         Config {
             api_base: env("KCS_API_BASE")
                 .unwrap_or_else(|| crate::kucoin::DEFAULT_API_BASE.to_string()),
+            exchange: env("KCS_EXCHANGE").unwrap_or_else(|| "kucoin".to_string()),
             // KCS_KLINE_INTERVALS="1min,1hour,4hour,1day,1week";
             // одиночный KCS_KLINE_INTERVAL принимается для совместимости.
             // По умолчанию — старшие таймфреймы без 1min.
@@ -85,6 +91,7 @@ impl Config {
             backfill_concurrency: env("KCS_BACKFILL_CONCURRENCY")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
+            db_url: env("KCS_DATABASE_URL").or_else(|| env("DATABASE_URL")),
         }
     }
 }

@@ -16,7 +16,9 @@
 //!      через `KCS_EMIT_CANDLES=1`.
 
 mod backfill;
+mod candle;
 mod config;
+mod db;
 mod http;
 mod kucoin;
 mod stats;
@@ -57,6 +59,9 @@ impl Generation {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Читаем .env из текущего каталога (если есть); уже заданные переменные
+    // окружения имеют приоритет и не перезаписываются.
+    let _ = dotenvy::dotenv();
     let cfg = Config::from_env();
     let emit_candles = cfg.emit_candles;
 
@@ -107,6 +112,38 @@ async fn main() -> anyhow::Result<()> {
         stats_reporter(stats_for_reporter, reporter_period).await;
     });
 
+    // Подключение к БД (если задан DATABASE_URL) и фоновый писатель свечей.
+    // Недоступная БД не роняет процесс: монитор продолжает работать,
+    // запись просто остаётся выключенной (без повторных попыток до рестарта).
+    let db_tx: Option<db::CandleSender> = match &cfg.db_url {
+        Some(url) => {
+            eprintln!("kcs-monitor: подключение к БД ...");
+            match db::spawn(url).await {
+                Ok(tx) => {
+                    eprintln!("kcs-monitor: запись свечей в БД включена");
+                    Some(tx)
+                }
+                Err(e) => {
+                    eprintln!("kcs-monitor: БД недоступна, продолжаю без записи: {e:#}");
+                    None
+                }
+            }
+        }
+        None => {
+            eprintln!("kcs-monitor: запись в БД выключена (нет DATABASE_URL)");
+            None
+        }
+    };
+
+    // Настройки соединений (единый набор для поколений и бэкфилла).
+    let conn_settings = stream::ConnSettings {
+        exchange: cfg.exchange.clone(),
+        api_base: cfg.api_base.clone(),
+        emit_candles,
+        subs_per_connection: cfg.subs_per_connection,
+        db_tx: db_tx.clone(),
+    };
+
     // Ресинк: None = выключен (ждём вечно), иначе период проверки.
     let resync_period = (cfg.resync_secs > 0).then(|| Duration::from_secs(cfg.resync_secs));
 
@@ -149,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.kline_intervals.len()
             );
             let summary = backfill::run(
-                &cfg.api_base,
+                &conn_settings,
                 &symbols,
                 &cfg.kline_intervals,
                 cfg.backfill_bars,
@@ -172,7 +209,8 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("kcs-monitor: {n} соединений не успели отписаться при ресинке");
                 }
             }
-            generation = Some(spawn_generation(&cfg, topics.clone(), &stats, emit_candles).await);
+            generation =
+                Some(spawn_generation(conn_settings.clone(), topics.clone(), &stats).await);
             let conns = generation.as_ref().expect("generation").tasks.len();
             eprintln!(
                 "kcs-monitor: поколение активно: топиков {}, соединений {}",
@@ -207,6 +245,9 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("kcs-monitor: {n} соединений не успели отписаться за отведённое время");
         }
     }
+    // Закрываем канал БД и даём писателю сбросить последнюю пачку.
+    drop(db_tx);
+    tokio::time::sleep(Duration::from_millis(500)).await;
     reporter.abort();
     print_stats(&stats);
     eprintln!("kcs-monitor: остановлен");
@@ -231,21 +272,19 @@ async fn shutdown_requested(wait: Duration) -> bool {
 
 /// Запускает соединения для одного набора топиков (одно поколение).
 async fn spawn_generation(
-    cfg: &Config,
+    settings: stream::ConnSettings,
     topics: Vec<String>,
     stats: &Arc<Stats>,
-    emit_candles: bool,
 ) -> Generation {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = tokio::task::JoinSet::new();
-    let api_base = cfg.api_base.clone();
-    for (conn_no, chunk) in topics.chunks(cfg.subs_per_connection).enumerate() {
-        let api_base = api_base.clone();
+    for (conn_no, chunk) in topics.chunks(settings.subs_per_connection).enumerate() {
+        let settings = settings.clone();
         let chunk = chunk.to_vec();
         let stats = stats.clone();
         let shutdown = shutdown_rx.clone();
         tasks.spawn(async move {
-            stream::run_connection(&api_base, chunk, conn_no, stats, emit_candles, shutdown).await
+            stream::run_connection(settings, chunk, conn_no, stats, shutdown).await
         });
     }
     Generation {

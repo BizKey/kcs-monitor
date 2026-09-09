@@ -24,3 +24,8 @@ target
 # Added by cargo
 
 /target
+
+# Local environment (секреты/доступы; см. .env.example)
+.env
+.env.*
+!.env.example

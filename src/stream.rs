@@ -12,6 +12,8 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
+use crate::candle;
+use crate::db::CandleSender;
 use crate::kucoin::BulletInfo;
 use crate::stats::Stats;
 
@@ -37,6 +39,16 @@ fn dbg_log(msg: &str) {
     }
 }
 
+/// Настройки, общие для всех соединений.
+#[derive(Clone)]
+pub struct ConnSettings {
+    pub exchange: String,
+    pub api_base: String,
+    pub emit_candles: bool,
+    pub subs_per_connection: usize,
+    pub db_tx: Option<CandleSender>,
+}
+
 /// Порог тишины на соединении: сервер шлёт ping каждые `pingInterval` мс,
 /// поэтому отсутствие любых сообщений дольше бюджета = мёртвое соединение.
 fn idle_budget(info: &BulletInfo) -> Duration {
@@ -49,11 +61,10 @@ fn idle_budget(info: &BulletInfo) -> Duration {
 /// Публичный WS-токен KuCoin действителен ограниченное время (около суток),
 /// поэтому свежий токен запрашивается перед каждой попыткой подключения.
 pub async fn run_connection(
-    api_base: &str,
+    settings: ConnSettings,
     topics: Vec<String>,
     conn_no: usize,
     stats: std::sync::Arc<Stats>,
-    emit_candles: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut attempt: u32 = 0;
@@ -63,7 +74,7 @@ pub async fn run_connection(
             return;
         }
         // Свежий токен/эндпоинт перед коннектом (переживает 24h-лимит токена).
-        let info = match crate::kucoin::fetch_bullet(api_base).await {
+        let info = match crate::kucoin::fetch_bullet(&settings.api_base).await {
             Ok(info) => info,
             Err(e) => {
                 eprintln!("[conn {conn_no}] не удалось получить ws-токен: {e:#}");
@@ -76,8 +87,7 @@ pub async fn run_connection(
                 continue;
             }
         };
-        let result =
-            connect_once(&info, &topics, conn_no, &stats, emit_candles, &mut shutdown).await;
+        let result = connect_once(&settings, &info, &topics, conn_no, &stats, &mut shutdown).await;
         // Сигнал остановки мог прийти во время connect_once — не переподключаемся.
         if *shutdown.borrow() {
             return;
@@ -119,11 +129,11 @@ async fn unsubscribe_and_close(ws: &mut WsStream, topics: &[String], conn_no: us
 
 /// Одно подключение: коннект, подписки, чтение до разрыва/ошибки/сигнала.
 async fn connect_once(
+    settings: &ConnSettings,
     info: &BulletInfo,
     topics: &[String],
     conn_no: usize,
     stats: &Stats,
-    emit_candles: bool,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let connect_id = std::time::SystemTime::now()
@@ -197,7 +207,7 @@ async fn connect_once(
                 };
                 match msg {
                     Message::Text(text) => {
-                        handle_text(&mut ws, text.to_string(), conn_no, stats, emit_candles).await?
+                        handle_text(&mut ws, text.to_string(), conn_no, stats, settings).await?
                     }
                     Message::Ping(payload) => {
                         dbg_log(&format!(
@@ -223,7 +233,7 @@ async fn handle_text(
     text: String,
     conn_no: usize,
     stats: &Stats,
-    emit_candles: bool,
+    settings: &ConnSettings,
 ) -> Result<()> {
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
@@ -259,19 +269,31 @@ async fn handle_text(
         "message" => {
             let topic = v.get("topic").and_then(|t| t.as_str()).unwrap_or("");
             // Считаем пришедшие сообщения канала свечей по интервалу.
-            if let Some(interval) = topic
+            let is_candle_topic = topic
                 .strip_prefix("/market/candles:")
-                .and_then(|rest| rest.split_once('_'))
-                .map(|(_, interval)| interval)
-            {
+                .is_some_and(|rest| rest.split_once('_').is_some());
+            if is_candle_topic {
+                let interval = topic
+                    .strip_prefix("/market/candles:")
+                    .and_then(|rest| rest.split_once('_'))
+                    .map(|(_, i)| i)
+                    .unwrap_or("?");
                 stats.record(interval);
-                if emit_candles {
-                    // Построчный вывод свечей — только по запросу (KCS_EMIT_CANDLES=1).
-                    if let Some(line) = candle_line(&v, topic) {
-                        emit(&line);
-                    } else {
-                        stats.record_parse_error();
+                match candle::parse_ws_candle(&v, topic, &settings.exchange) {
+                    Some(candle_update) => {
+                        // Запись в БД (если подключена).
+                        if let Some(tx) = settings.db_tx.as_ref()
+                            && tx.send(candle_update.clone()).await.is_err()
+                        {
+                            eprintln!("[conn {conn_no}] канал записи в БД закрыт");
+                        }
+                        // Построчный вывод свечей — только по запросу (KCS_EMIT_CANDLES=1).
+                        if settings.emit_candles {
+                            let line = candle::candle_to_json_line(&candle_update);
+                            emit(&line);
+                        }
                     }
+                    None => stats.record_parse_error(),
                 }
             }
         }
@@ -280,79 +302,6 @@ async fn handle_text(
         other => eprintln!("[ws] неизвестный тип '{other}': {text}"),
     }
     Ok(())
-}
-
-/// Извлекает (символ, интервал) из топика `/market/candles:SYM_1min`.
-fn symbol_interval_from_topic(topic: &str) -> Option<(String, String)> {
-    let rest = topic.strip_prefix("/market/candles:")?;
-    let (symbol, interval) = rest.split_once('_')?;
-    Some((symbol.to_string(), interval.to_string()))
-}
-
-/// Строит строку лога из сообщения канала свечей (новый и старый форматы).
-fn candle_line(v: &serde_json::Value, topic: &str) -> Option<String> {
-    let data = v.get("data")?;
-    let (topic_symbol, topic_interval) = symbol_interval_from_topic(topic)?;
-
-    let (symbol, candles, update_ms) = match data {
-        // Новый формат: {"symbol": "...", "candles": [...], "time": ...}
-        serde_json::Value::Object(map) => {
-            let candles = map.get("candles")?.as_array()?;
-            let symbol = map
-                .get("symbol")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or(topic_symbol.clone());
-            let update_ms = map.get("time").and_then(|t| t.as_i64());
-            (symbol, candles, update_ms)
-        }
-        // Старый формат: data — сразу массив свечи.
-        serde_json::Value::Array(candles) => (topic_symbol.clone(), candles, None),
-        _ => return None,
-    };
-
-    if candles.len() != 7 {
-        return None;
-    }
-    let num = |i: usize| candles[i].as_str().and_then(|s| s.parse::<f64>().ok());
-    let start = candles[0].as_str()?.parse::<i64>().ok()?;
-    let open = num(1)?;
-    let close = num(2)?;
-    let high = num(3)?;
-    let low = num(4)?;
-    let volume = num(5)?;
-    let turnover = num(6)?;
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    // Поле time у KuCoin в новых сообщениях — в наносекундах; нормализуем в мс.
-    let update_ms = update_ms.map(|t| {
-        if t >= 100_000_000_000_000 {
-            t / 1_000_000
-        } else {
-            t
-        }
-    });
-
-    let rec = json!({
-        "type": "candle",
-        "exchange": "kucoin",
-        "ts": ts,
-        "symbol": symbol,
-        "interval": topic_interval,
-        "start": start,
-        "update": update_ms,
-        "open": open,
-        "close": close,
-        "high": high,
-        "low": low,
-        "volume": volume,
-        "turnover": turnover,
-    });
-    Some(rec.to_string())
 }
 
 /// Атомарно печатает строку в stdout.

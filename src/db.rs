@@ -1,0 +1,102 @@
+//! Запись свечей в PostgreSQL.
+//!
+//! Один фоновый «батчер» получает свечи из mpsc-канала и пишет их в таблицу
+//! `candles` пачками через один INSERT ... ON CONFLICT DO UPDATE (источник —
+//! миграции проекта sqlxmigrator / наш migrations).
+
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use sqlx::postgres::PgPoolOptions;
+use tokio::sync::mpsc;
+
+use crate::candle::CandleUpdate;
+
+/// Размер пачки перед записью (или таймаут накопления).
+const BATCH_SIZE: usize = 500;
+const BATCH_FLUSH: Duration = Duration::from_millis(200);
+
+/// Канал, по которому соединения шлют свечи на запись.
+pub type CandleSender = mpsc::Sender<CandleUpdate>;
+
+/// Подключается к БД и запускает фоновый писатель; возвращает sender.
+pub async fn spawn(db_url: &str) -> Result<CandleSender> {
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(db_url)
+        .await
+        .with_context(|| format!("подключение к БД: {db_url}"))?;
+
+    let (tx, mut rx) = mpsc::channel::<CandleUpdate>(BATCH_SIZE * 4);
+    tokio::spawn(async move {
+        let mut inserted: u64 = 0;
+        let mut errors: u64 = 0;
+        loop {
+            // Ждём первую свечу пачки.
+            let first = match rx.recv().await {
+                Some(c) => c,
+                None => {
+                    eprintln!("[db] канал закрыт, всего записано {inserted}, ошибок {errors}");
+                    break;
+                }
+            };
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+            batch.push(first);
+            // Добираем остаток пачки без ожидания.
+            let flush_at = tokio::time::Instant::now() + BATCH_FLUSH;
+            while batch.len() < BATCH_SIZE {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(flush_at) => break,
+                    c = rx.recv() => match c {
+                        Some(c) => batch.push(c),
+                        None => break,
+                    }
+                }
+            }
+            match upsert_batch(&pool, &batch).await {
+                Ok(n) => inserted += n as u64,
+                Err(e) => {
+                    errors += 1;
+                    eprintln!("[db] ошибка записи пачки из {}: {e:#}", batch.len());
+                }
+            }
+        }
+    });
+    Ok(tx)
+}
+
+/// Статический upsert одной свечи (используется внутри транзакции).
+const UPSERT_ONE: &str = "INSERT INTO candles \
+     (exchange, symbol, timeframe, start_ts, open, high, low, close, volume, turnover) \
+     VALUES ($1, $2, $3, $4, $5::numeric, $6::numeric, $7::numeric, $8::numeric, $9::numeric, $10::numeric) \
+     ON CONFLICT (exchange, symbol, timeframe, start_ts) DO UPDATE SET \
+     open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, \
+     close = EXCLUDED.close, volume = EXCLUDED.volume, \
+     turnover = EXCLUDED.turnover, update_time = now()";
+
+/// Пишет пачку в одной транзакции.
+async fn upsert_batch(pool: &sqlx::PgPool, batch: &[CandleUpdate]) -> Result<usize> {
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool.begin().await.context("BEGIN")?;
+    for c in batch {
+        sqlx::query(UPSERT_ONE)
+            .bind(&c.exchange)
+            .bind(&c.symbol)
+            .bind(&c.interval)
+            .bind(c.start_ts)
+            .bind(c.open)
+            .bind(c.close)
+            .bind(c.high)
+            .bind(c.low)
+            .bind(c.volume)
+            .bind(c.turnover)
+            .execute(&mut *tx)
+            .await
+            .context("upsert свечи")?;
+    }
+    tx.commit().await.context("COMMIT")?;
+    Ok(batch.len())
+}

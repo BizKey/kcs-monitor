@@ -1,19 +1,20 @@
 //! REST-бэкфилл закрытых свечей.
 //!
 //! При запуске (KCS_BACKFILL_BARS=N) для каждой пары × интервала через REST
-//! `/api/v1/market/candles` запрашиваются последние закрытые бары и выводятся
-//! в stdout JSON-строками с `"final": true`. Это позволяет «долечить»
-//! последнюю строку в БД, если процесс падал и в ней застряла нефинальная
-//! (формирующаяся) свеча. Запись в БД пока не производится — только вывод.
+//! `/api/v1/market/candles` запрашиваются последние закрытые бары и
+//! отправляются в БД (если подключена) и/или выводятся в stdout
+//! JSON-строками с `"final": true`. Это «долечивает» последнюю строку в БД,
+//! если процесс падал и в ней застряла нефинальная (формирующаяся) свеча.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use serde_json::json;
 use tokio::sync::Semaphore;
 
+use crate::candle::{CandleUpdate, candle_to_json_line, from_rest_candle};
 use crate::kucoin::{RestCandle, fetch_kline_page, forming_bucket_start};
+use crate::stream::ConnSettings;
 
 /// Максимум баров, которые REST отдаёт за один запрос (страница).
 const PAGE_MAX: usize = 100;
@@ -28,42 +29,21 @@ pub struct Summary {
     pub lines: u64,
 }
 
-/// Печатает одну закрытую свечу в stdout (JSON-строка).
-fn emit_closed(symbol: &str, interval: &str, c: &RestCandle) {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let rec = json!({
-        "type": "candle",
-        "source": "backfill",
-        "final": true,
-        "exchange": "kucoin",
-        "ts": ts,
-        "symbol": symbol,
-        "interval": interval,
-        "start": c.start_ts,
-        "open": c.open,
-        "close": c.close,
-        "high": c.high,
-        "low": c.low,
-        "volume": c.volume,
-        "turnover": c.turnover,
-    });
+/// Печатает свечу в stdout.
+fn emit_line(c: &CandleUpdate) {
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let _ = writeln!(out, "{rec}");
+    let _ = writeln!(out, "{}", candle_to_json_line(c));
 }
 
-/// Забирает с REST до `bars` последних закрытых свечей (новые сверху) и
-/// печатает их в хронологическом порядке. Возвращает число выведенных.
-async fn backfill_pair_interval(
+/// Забирает с REST до `bars` последних закрытых свечей (новые сверху).
+async fn fetch_closed(
     api_base: &str,
     symbol: &str,
     interval: &str,
     bars: usize,
-) -> Result<u64> {
+) -> Result<Vec<RestCandle>> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -100,17 +80,13 @@ async fn backfill_pair_interval(
     }
 
     closed.truncate(bars.min(BARS_CAP));
-    let n = closed.len();
-    // Печатаем от старых к новым.
-    for c in closed.iter().rev() {
-        emit_closed(symbol, interval, c);
-    }
-    Ok(n as u64)
+    Ok(closed)
 }
 
 /// Запускает бэкфилл для всех пар × интервалов c ограниченной конкурентностью.
+/// Каждая свеча отправляется в БД (если `db_tx` есть) и/или печатается.
 pub async fn run(
-    api_base: &str,
+    settings: &ConnSettings,
     symbols: &[String],
     intervals: &[String],
     bars: usize,
@@ -123,16 +99,33 @@ pub async fn run(
     let cap = bars.min(BARS_CAP);
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = tokio::task::JoinSet::new();
+    let print_if_no_db = settings.db_tx.is_none() || settings.emit_candles;
 
     for symbol in symbols {
         for interval in intervals {
-            let api_base = api_base.to_string();
+            let exchange = settings.exchange.clone();
+            let api_base = settings.api_base.clone();
             let symbol = symbol.clone();
             let interval = interval.clone();
             let sem = sem.clone();
+            let db_tx = settings.db_tx.clone();
+            let print = print_if_no_db;
             tasks.spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore");
-                backfill_pair_interval(&api_base, &symbol, &interval, cap).await
+                let closed = fetch_closed(&api_base, &symbol, &interval, cap).await?;
+                let mut n = 0u64;
+                // От старых к новым.
+                for c in closed.iter().rev() {
+                    let update = from_rest_candle(&exchange, &symbol, &interval, c.clone());
+                    if let Some(tx) = &db_tx {
+                        tx.send(update.clone()).await.ok();
+                    }
+                    if print {
+                        emit_line(&update);
+                    }
+                    n += 1;
+                }
+                Ok::<u64, anyhow::Error>(n)
             });
         }
     }

@@ -4,4 +4,9 @@ target/
 .github/
 Dockerfile
 .dockerignore
+docker-compose.yml
+migrations/
+.env
+.env.*
+!.env.example
 *.md

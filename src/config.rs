@@ -9,8 +9,11 @@ pub struct Config {
     pub exchange: String,
     /// Таймфреймы свечей (KuCoin): 1min..1week.
     pub kline_intervals: Vec<String>,
-    /// Сколько последних ЗАКРЫТЫХ баров тянуть на пару×интервал.
+    /// Сколько последних ЗАКРЫТЫХ баров тянуть в обычном свипе.
     pub bars: usize,
+    /// Глубина первого свипа процесса (первичная загрузка истории).
+    /// 0 = использовать `bars` как обычно.
+    pub bars_first: usize,
     /// Максимум одновременных REST-запросов.
     pub concurrency: usize,
     /// Пауза между свипами, секунды. 0 = один проход и выход (для cron).
@@ -52,6 +55,9 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3)
                 .max(1),
+            bars_first: env("KCS_BARS_FIRST")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
             concurrency: env("KCS_CONCURRENCY")
                 .or_else(|| env("KCS_BACKFILL_CONCURRENCY"))
                 .and_then(|v| v.parse().ok())

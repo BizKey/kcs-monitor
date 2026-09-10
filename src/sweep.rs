@@ -2,7 +2,7 @@
 //! последние закрытые бары и пишем их в БД (или печатаем, если БД не задана).
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use tokio::sync::Semaphore;
@@ -34,6 +34,9 @@ fn emit_line(c: &crate::candle::CandleUpdate) {
 }
 
 /// Забирает с REST до `bars` последних ЗАКРЫТЫХ свечей (новые сверху).
+///
+/// Первый запрос ограничиваем окном `startAt`, чтобы биржа не отдавала
+/// лишние строки: при 3 барах это вместо 100 строк пары — 3.
 async fn fetch_closed(
     api_base: &str,
     symbol: &str,
@@ -44,22 +47,26 @@ async fn fetch_closed(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let period = crate::kucoin::interval_seconds(interval)
+        .ok_or_else(|| anyhow::anyhow!("неизвестный интервал {interval}"))? as i64;
     let forming = forming_bucket_start(interval, now)
         .ok_or_else(|| anyhow::anyhow!("неизвестный интервал {interval}"))?;
 
     let cap = bars.min(BARS_CAP);
     let mut closed: Vec<RestCandle> = Vec::with_capacity(cap);
+    // Первая страница: строго окно нужных баров (чуть шире — на погранслучаи).
+    let mut start_at: Option<i64> = Some(forming - period * (cap as i64 + 1));
     let mut end_at: Option<i64> = Some(now);
     let mut pages = 0usize;
 
     while closed.len() < cap && pages < BARS_CAP / PAGE_MAX + 2 {
-        let page = fetch_kline_page(api_base, symbol, interval, None, end_at).await?;
+        let page = fetch_with_retries(api_base, symbol, interval, start_at, end_at).await?;
         pages += 1;
         if page.is_empty() {
             break;
         }
         let oldest = page.last().expect("not empty").start_ts;
-        // Первая строка может быть текущей (незакрытой) свечой — пропускаем.
+        // Строки текущего (незакрытого) бара отбрасываем.
         for c in page {
             if c.start_ts < forming {
                 closed.push(c);
@@ -68,7 +75,8 @@ async fn fetch_closed(
         if closed.len() >= cap {
             break;
         }
-        // Следующая страница — строго старее самой старой строки.
+        // Нужно глубже: идём в прошлое страницами (по 100 строк).
+        start_at = None;
         let next_end = oldest - 1;
         if Some(next_end) >= end_at {
             break; // защита от зацикливания
@@ -80,8 +88,39 @@ async fn fetch_closed(
     Ok(closed)
 }
 
+/// Запрос истории с парой повторных попыток: сеть/TLS иногда отваливается
+/// (`tls handshake eof`), и одна неудачная пара не должна портить свип.
+async fn fetch_with_retries(
+    api_base: &str,
+    symbol: &str,
+    interval: &str,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
+) -> Result<Vec<RestCandle>> {
+    const ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        match fetch_kline_page(api_base, symbol, interval, start_at, end_at).await {
+            Ok(rows) => return Ok(rows),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < ATTEMPTS {
+                    let pause = Duration::from_millis(300 * u64::from(attempt));
+                    tokio::time::sleep(pause).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("ошибка попытки"))
+}
+
 /// Один свип по всем парам × интервалам с ограниченной конкурентностью.
-pub async fn run(cfg: &Config, symbols: &[String], db_tx: Option<&CandleSender>) -> Summary {
+pub async fn run(
+    cfg: &Config,
+    symbols: &[String],
+    bars: usize,
+    db_tx: Option<&CandleSender>,
+) -> Summary {
     let mut summary = Summary::default();
     if symbols.is_empty() || cfg.kline_intervals.is_empty() {
         return summary;
@@ -95,7 +134,6 @@ pub async fn run(cfg: &Config, symbols: &[String], db_tx: Option<&CandleSender>)
             let exchange = cfg.exchange.clone();
             let symbol = symbol.clone();
             let interval = interval.clone();
-            let bars = cfg.bars;
             let sem = sem.clone();
             let db_tx = db_tx.cloned();
             tasks.spawn(async move {

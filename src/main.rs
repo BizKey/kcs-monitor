@@ -43,10 +43,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     eprintln!(
-        "kcs-monitor: exchange={} intervals={} bars={} concurrency={} пауза={} api={}",
+        "kcs-monitor: exchange={} intervals={} bars={} (первый свип: {}) concurrency={} пауза={} api={}",
         cfg.exchange,
         cfg.kline_intervals.join(","),
         cfg.bars,
+        if cfg.bars_first > 0 {
+            cfg.bars_first.to_string()
+        } else {
+            "как обычный".to_string()
+        },
         cfg.concurrency,
         if cfg.interval_secs == 0 {
             "нет (один проход)".to_string()
@@ -82,15 +87,22 @@ async fn main() -> anyhow::Result<()> {
         if symbols.is_empty() {
             eprintln!("kcs-monitor: список символов пуст — пропускаю цикл");
         } else {
+            // Первый свип процесса — первичная загрузка истории (глубже),
+            // последующие — только свежие бары.
+            let bars = if sweep_no == 1 && cfg.bars_first > 0 {
+                cfg.bars_first
+            } else {
+                cfg.bars
+            };
             let summary = tokio::select! {
                 _ = wait_for_shutdown() => {
                     eprintln!("kcs-monitor: остановка по сигналу");
                     break;
                 }
-                s = sweep::run(&cfg, &symbols, db_tx.as_ref()) => s,
+                s = sweep::run(&cfg, &symbols, bars, db_tx.as_ref()) => s,
             };
             eprintln!(
-                "kcs-monitor: свип #{sweep_no} за {:.1}s: пар ок {}, ошибок {}, свечей {}",
+                "kcs-monitor: свип #{sweep_no} ({bars} бар/пару) за {:.1}s: пар ок {}, ошибок {}, свечей {}",
                 started.elapsed().as_secs_f64(),
                 summary.pairs_ok,
                 summary.pairs_err,

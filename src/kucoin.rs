@@ -34,16 +34,13 @@ pub fn interval_seconds(interval: &str) -> Option<u64> {
 
 /// Начало текущего (ещё не закрытого) бара по времени `now` (unix-сек).
 /// Всё, что имеет `start_ts` меньше этого значения, — закрытые свечи.
-/// Неделя у KuCoin начинается в понедельник 00:00 UTC, поэтому для неё нужна
-/// поправка (эпоха Unix стартовала в четверг).
+///
+/// Все интервалы KuCoin выровнены по эпохе Unix без смещений: проверено по API,
+/// недельные свечи начинаются в четверг 00:00 UTC (эпоха тоже стартовала в
+/// четверг), поэтому отдельная поправка для `1week` не нужна.
 pub fn forming_bucket_start(interval: &str, now: i64) -> Option<i64> {
     let period = interval_seconds(interval)? as i64;
-    if interval == "1week" {
-        const MONDAY_OFFSET: i64 = 3 * 86_400;
-        Some((now + MONDAY_OFFSET) / period * period - MONDAY_OFFSET)
-    } else {
-        Some(now / period * period)
-    }
+    Some(now / period * period)
 }
 
 /// Строка свечи из REST: [start, open, close, high, low, volume, turnover].
@@ -189,19 +186,19 @@ mod tests {
     }
 
     #[test]
-    fn weekly_bucket_starts_on_monday() {
-        let monday = 1_788_739_200; // понедельник 2026-09-07 00:00 UTC
+    fn weekly_bucket_matches_kucoin_anchor() {
+        // KuCoin начинает недельные свечи в четверг 00:00 UTC — значения взяты
+        // из реального ответа API (BTC-USDT, type=1week).
+        let week = 1_788_393_600; // четверг 2026-09-03 00:00 UTC
         for day in 0..7 {
-            let now = monday + day * 86_400 + 3600;
-            assert_eq!(
-                forming_bucket_start("1week", now),
-                Some(monday),
-                "day {day}"
-            );
+            let now = week + day * 86_400 + 3600;
+            assert_eq!(forming_bucket_start("1week", now), Some(week), "day {day}");
         }
+        let next_week = week + 7 * 86_400; // четверг 2026-09-10
+        assert_eq!(forming_bucket_start("1week", next_week), Some(next_week));
         assert_eq!(
-            forming_bucket_start("1week", monday + 7 * 86_400),
-            Some(monday + 7 * 86_400)
+            forming_bucket_start("1week", next_week + 6 * 86_400),
+            Some(next_week)
         );
     }
 }

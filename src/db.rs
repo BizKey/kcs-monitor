@@ -82,14 +82,16 @@ async fn upsert_batch(pool: &sqlx::PgPool, batch: &[CandleUpdate]) -> Result<usi
     let mut tx = pool.begin().await.context("BEGIN")?;
     for c in batch {
         sqlx::query(UPSERT_ONE)
+            // ВАЖНО: порядок bind() обязан совпадать с порядком колонок в
+            // UPSERT_ONE (см. тест bind_order_matches_columns ниже).
             .bind(&c.exchange)
             .bind(&c.symbol)
             .bind(&c.interval)
             .bind(c.start_ts)
             .bind(c.open)
-            .bind(c.close)
             .bind(c.high)
             .bind(c.low)
+            .bind(c.close)
             .bind(c.volume)
             .bind(c.turnover)
             .execute(&mut *tx)
@@ -98,4 +100,36 @@ async fn upsert_batch(pool: &sqlx::PgPool, batch: &[CandleUpdate]) -> Result<usi
     }
     tx.commit().await.context("COMMIT")?;
     Ok(batch.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Порядок колонок в UPSERT_ONE. Обязан совпадать с порядком bind()
+    /// в upsert_batch — иначе значения уедут в чужие колонки (такая ошибка
+    /// однажды уже приводила к high/low/close в неправильных полях).
+    const EXPECTED_COLUMNS: [&str; 10] = [
+        "exchange",
+        "symbol",
+        "timeframe",
+        "start_ts",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "turnover",
+    ];
+
+    #[test]
+    fn bind_order_matches_columns() {
+        let cols_start = UPSERT_ONE.find('(').expect("скобка колонок");
+        let cols_end = UPSERT_ONE.find(')').expect("конец списка колонок");
+        let columns: Vec<&str> = UPSERT_ONE[cols_start + 1..cols_end]
+            .split(',')
+            .map(|c| c.trim())
+            .collect();
+        assert_eq!(columns, EXPECTED_COLUMNS);
+    }
 }

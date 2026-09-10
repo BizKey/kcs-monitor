@@ -5,9 +5,17 @@
 # приложение берёт из файла .env; если файла нет или переменной в нём нет —
 # работают встроенные в приложение значения по умолчанию (БД тогда отключена).
 #
-# Запуск:     docker compose up -d
-# Логи:       docker compose logs -f
-# Остановка:  docker compose down
+# Приложение работает циклом: REST-свип закрытых свечей → пауза
+# KCS_INTERVAL_SECONDS (по умолчанию 600 с) → снова свип.
+#
+# Запуск:      docker compose up -d        (restart: unless-stopped поднимает
+#                                          после падений и перезагрузки хоста)
+# Логи:        docker compose logs -f
+# Остановка:   docker compose down         (SIGTERM: процесс сбросит буфер БД)
+#
+# Вариант «по расписанию» вместо цикла: поставь KCS_INTERVAL_SECONDS=0 и
+# вызывай разово из cron:
+#      5 * * * * cd /opt/kcs-monitor && docker compose run --rm app
 #
 # Создайте .env из .env.example и укажите как минимум DATABASE_URL.
 # .env не коммитится; секреты храните вне репозитория.

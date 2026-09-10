@@ -34,8 +34,8 @@ fn split_base(api_base: &str) -> Result<(&str, String)> {
     }
 }
 
-/// Выполняет HTTPS-запрос и возвращает тело ответа.
-pub async fn request(api_base: &str, method: &str, path: &str, body: &str) -> Result<Vec<u8>> {
+/// Выполняет HTTPS GET-запрос и возвращает тело ответа.
+pub async fn request(api_base: &str, path: &str) -> Result<Vec<u8>> {
     let (host, prefix) = split_base(api_base)?;
     let req_path = format!("{prefix}{path}");
 
@@ -50,14 +50,11 @@ pub async fn request(api_base: &str, method: &str, path: &str, body: &str) -> Re
         .context("TLS handshake")?;
 
     let request = format!(
-        "{method} {req_path} HTTP/1.1\r\n\
+        "GET {req_path} HTTP/1.1\r\n\
          Host: {host}\r\n\
          User-Agent: kcs-monitor/0.1\r\n\
          Accept: application/json\r\n\
-         Content-Type: application/json\r\n\
-         Connection: close\r\n\
-         Content-Length: {}\r\n\r\n{body}",
-        body.len()
+         Connection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await?;
     stream.flush().await?;
@@ -152,21 +149,6 @@ fn parse_json(body: &[u8]) -> Result<serde_json::Value> {
 
 /// GET-запрос, ответ парсится как JSON.
 pub async fn get_json(api_base: &str, path: &str) -> Result<serde_json::Value> {
-    let body = request(api_base, "GET", path, "").await?;
-    parse_json(&body)
-}
-
-/// POST-запрос с JSON-телом (или пустым), ответ парсится как JSON.
-pub async fn post_json(
-    api_base: &str,
-    path: &str,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    let payload = if body.is_null() {
-        String::new()
-    } else {
-        body.to_string()
-    };
-    let body = request(api_base, "POST", path, &payload).await?;
+    let body = request(api_base, path).await?;
     parse_json(&body)
 }

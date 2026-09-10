@@ -1,4 +1,4 @@
-//! KuCoin REST: список торгуемых символов и публичный WS-токен.
+//! KuCoin REST: список торгуемых символов и история свечей.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -6,14 +6,13 @@ use serde::Deserialize;
 pub const DEFAULT_API_BASE: &str = "https://api.kucoin.com";
 const OK_CODE: &str = "200000";
 
-/// Допустимые типы свечей KuCoin (spot): используются в топиках подписки
-/// и в параметре `type` REST-запроса истории.
+/// Допустимые типы свечей KuCoin (spot) — используются в параметре `type`.
 pub const VALID_KLINE_INTERVALS: &[&str] = &[
     "1min", "3min", "5min", "15min", "30min", "1hour", "2hour", "4hour", "6hour", "8hour",
     "12hour", "1day", "1week",
 ];
 
-/// Длина интервала в секундах (для расчёта границ закрытия свечей).
+/// Длина интервала в секундах.
 pub fn interval_seconds(interval: &str) -> Option<u64> {
     Some(match interval {
         "1min" => 60,
@@ -33,10 +32,10 @@ pub fn interval_seconds(interval: &str) -> Option<u64> {
     })
 }
 
-/// Начало текущего «открытого» бара интервала по времени `now` (unix-сек).
-/// Все бары со start меньше этого значения — закрыты. Неделя у KuCoin
-/// начинается в понедельник 00:00 UTC, поэтому нужна поправка
-/// (эпоха Unix стартовала в четверг).
+/// Начало текущего (ещё не закрытого) бара по времени `now` (unix-сек).
+/// Всё, что имеет `start_ts` меньше этого значения, — закрытые свечи.
+/// Неделя у KuCoin начинается в понедельник 00:00 UTC, поэтому для неё нужна
+/// поправка (эпоха Unix стартовала в четверг).
 pub fn forming_bucket_start(interval: &str, now: i64) -> Option<i64> {
     let period = interval_seconds(interval)? as i64;
     if interval == "1week" {
@@ -47,8 +46,7 @@ pub fn forming_bucket_start(interval: &str, now: i64) -> Option<i64> {
     }
 }
 
-/// Одна строка свечи из REST `/api/v1/market/candles`:
-/// [start, open, close, high, low, volume, turnover].
+/// Строка свечи из REST: [start, open, close, high, low, volume, turnover].
 #[derive(Debug, Clone)]
 pub struct RestCandle {
     pub start_ts: i64,
@@ -58,6 +56,57 @@ pub struct RestCandle {
     pub low: f64,
     pub volume: f64,
     pub turnover: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct Symbol {
+    #[serde(rename = "symbol")]
+    symbol: String,
+    #[serde(rename = "enableTrading", default)]
+    enable_trading: bool,
+}
+
+/// Проверяет код ответа KuCoin API.
+fn ensure_ok(v: &serde_json::Value) -> Result<()> {
+    match v.get("code").and_then(|c| c.as_str()) {
+        Some(OK_CODE) => Ok(()),
+        other => bail!(
+            "KuCoin API code={:?} msg={:?}",
+            other,
+            v.get("msg").and_then(|m| m.as_str())
+        ),
+    }
+}
+
+/// Возвращает отсортированный список торгуемых пар (или отфильтрованный по
+/// `symbols_override`, если он задан).
+pub async fn fetch_symbols(
+    api_base: &str,
+    symbols_override: &Option<String>,
+) -> Result<Vec<String>> {
+    let v = crate::http::get_json(api_base, "/api/v1/symbols").await?;
+    ensure_ok(&v)?;
+    let symbols: Vec<Symbol> = serde_json::from_value(
+        v.get("data")
+            .cloned()
+            .context("нет data в ответе symbols")?,
+    )
+    .context("не удалось разобрать список символов")?;
+
+    let mut list: Vec<String> = symbols
+        .into_iter()
+        .filter(|s| s.enable_trading)
+        .map(|s| s.symbol)
+        .collect();
+
+    if let Some(filter) = symbols_override {
+        let wanted: std::collections::HashSet<String> =
+            filter.split(',').map(|s| s.trim().to_string()).collect();
+        list.retain(|s| wanted.contains(s));
+    }
+    list.sort();
+    list.dedup();
+    Ok(list)
 }
 
 /// Запрашивает страницу свечей (новые сверху, до ~100 строк) за окно
@@ -118,102 +167,41 @@ pub async fn fetch_kline_page(
     Ok(out)
 }
 
-#[derive(Debug, Clone)]
-pub struct BulletInfo {
-    /// Токен для подключения к публичному WebSocket.
-    pub token: String,
-    /// Адрес WS-шлюза (берём из ответа bullet-public, а не хардкодим).
-    pub endpoint: String,
-    pub ping_interval_ms: u64,
-    pub ping_timeout_ms: u64,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Debug, Deserialize)]
-struct Symbol {
-    #[serde(rename = "symbol")]
-    symbol: String,
-    #[serde(rename = "enableTrading", default)]
-    enable_trading: bool,
-}
-
-/// Проверяет код ответа KuCoin API.
-fn ensure_ok(v: &serde_json::Value) -> Result<()> {
-    match v.get("code").and_then(|c| c.as_str()) {
-        Some(OK_CODE) => Ok(()),
-        other => bail!(
-            "KuCoin API code={:?} msg={:?}",
-            other,
-            v.get("msg").and_then(|m| m.as_str())
-        ),
+    #[test]
+    fn interval_seconds_known_values() {
+        assert_eq!(interval_seconds("1min"), Some(60));
+        assert_eq!(interval_seconds("1hour"), Some(3600));
+        assert_eq!(interval_seconds("1day"), Some(86_400));
+        assert_eq!(interval_seconds("1week"), Some(604_800));
+        assert_eq!(interval_seconds("2days"), None);
     }
-}
 
-/// Возвращает отсортированный список торгуемых пар (или отфильтрованный по
-/// `symbols_override`, если он задан).
-pub async fn fetch_symbols(
-    api_base: &str,
-    symbols_override: &Option<String>,
-) -> Result<Vec<String>> {
-    let v = crate::http::get_json(api_base, "/api/v1/symbols").await?;
-    ensure_ok(&v)?;
-    let symbols: Vec<Symbol> = serde_json::from_value(
-        v.get("data")
-            .cloned()
-            .context("нет data в ответе symbols")?,
-    )
-    .context("не удалось разобрать список символов")?;
-
-    let mut list: Vec<String> = symbols
-        .into_iter()
-        .filter(|s| s.enable_trading)
-        .map(|s| s.symbol)
-        .collect();
-
-    if let Some(filter) = symbols_override {
-        let wanted: std::collections::HashSet<String> =
-            filter.split(',').map(|s| s.trim().to_string()).collect();
-        list.retain(|s| wanted.contains(s));
+    #[test]
+    fn hour_bucket_is_utc_aligned() {
+        let now = 1_788_947_696; // 2026-09-09 12:34:56 UTC
+        let start = forming_bucket_start("1hour", now).unwrap();
+        assert_eq!(start % 3600, 0);
+        assert!(start <= now && now - start < 3600);
     }
-    list.sort();
-    list.dedup();
-    Ok(list)
-}
 
-/// Получает публичный WS-токен и адрес шлюза.
-pub async fn fetch_bullet(api_base: &str) -> Result<BulletInfo> {
-    let v =
-        crate::http::post_json(api_base, "/api/v1/bullet-public", &serde_json::Value::Null).await?;
-    ensure_ok(&v)?;
-    let data = v.get("data").context("нет data в ответе bullet-public")?;
-    let token = data
-        .get("token")
-        .and_then(|t| t.as_str())
-        .context("нет token")?
-        .to_string();
-    let server = data
-        .get("instanceServers")
-        .and_then(|s| s.as_array())
-        .and_then(|arr| arr.first())
-        .context("нет instanceServers")?;
-    let endpoint = server
-        .get("endpoint")
-        .and_then(|e| e.as_str())
-        .context("нет endpoint")?
-        .trim_end_matches('/')
-        .to_string();
-    let ping_interval_ms = server
-        .get("pingInterval")
-        .and_then(|p| p.as_u64())
-        .unwrap_or(18_000);
-    let ping_timeout_ms = server
-        .get("pingTimeout")
-        .and_then(|p| p.as_u64())
-        .unwrap_or(10_000);
-
-    Ok(BulletInfo {
-        token,
-        endpoint,
-        ping_interval_ms,
-        ping_timeout_ms,
-    })
+    #[test]
+    fn weekly_bucket_starts_on_monday() {
+        let monday = 1_788_739_200; // понедельник 2026-09-07 00:00 UTC
+        for day in 0..7 {
+            let now = monday + day * 86_400 + 3600;
+            assert_eq!(
+                forming_bucket_start("1week", now),
+                Some(monday),
+                "day {day}"
+            );
+        }
+        assert_eq!(
+            forming_bucket_start("1week", monday + 7 * 86_400),
+            Some(monday + 7 * 86_400)
+        );
+    }
 }
